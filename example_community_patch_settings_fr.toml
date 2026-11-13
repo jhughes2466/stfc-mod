@@ -967,6 +967,10 @@ slots = true
 # Sync faction store offer data. Requires mod 1.1.10 or newer.
 store_offers = false
 
+# Voulez-vous synchroniser les événements (écran Événements : calendrier, paliers, récompenses et votre propre score) ? Optionnel, désactivé par défaut.
+# Seul votre propre classement est envoyé, jamais les classements des autres joueurs.
+events = false
+
 # Voulez-vous synchroniser les données de technologie interdite possédée ?
 tech = true
 

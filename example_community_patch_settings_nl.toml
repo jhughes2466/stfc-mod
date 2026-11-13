@@ -967,6 +967,10 @@ slots = true
 # Sync faction store offer data. Requires mod 1.1.10 or newer.
 store_offers = false
 
+# Wil je evenementen syncen (het Events-scherm: planning, mijlpalen, beloningen en je eigen score)? Opt-in, standaard uit.
+# Alleen je eigen stand wordt verstuurd, nooit de ranglijsten van andere spelers.
+events = false
+
 # Wil je data van de verboden technologie die je in bezit hebt syncen?
 tech = true
 

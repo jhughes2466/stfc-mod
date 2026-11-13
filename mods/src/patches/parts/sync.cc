@@ -7,6 +7,7 @@
 
 #include <Digit.Platform.Models.pb.h>
 #include <Digit.PrimePlatform.Content.pb.h>
+#include <Digit.PrimePlatform.Models.pb.h>
 #include <Digit.PrimeServer.Models.pb.h>
 #include <stfc.sync.pb.h>
 #include <il2cpp-api-types.h>
@@ -38,6 +39,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -1859,17 +1861,37 @@ static void jobs(std::unique_ptr<std::string>&& bytes)
 static void active_missions(std::unique_ptr<std::string>&& bytes)
 {
   using json = nlohmann::json;
-  static std::unordered_set<int64_t> active_mission_states;
-  static std::mutex                  active_mission_states_mtx;
+  // keyed by mission id; the value is the record we last sent, so a step change re-sends just like a new mission
+  static std::map<int64_t, json> active_mission_states;
+  static std::mutex              active_mission_states_mtx;
 
   if (auto response = Digit::PrimeServer::Models::ActiveMissionsResponse(); response.ParseFromString(*bytes)) {
 
     http::logging::trace("PROCESS", "active missions",
                          STR_FORMAT("Processing {} active missions", response.activemissions_size()));
 
-    std::unordered_set<int64_t> active_missions;
+    std::map<int64_t, json> active_missions;
     for (const auto& mission : response.activemissions()) {
-      active_missions.insert(mission.id());
+      json record = {{"type", "active_" + SyncConfig::Type::Missions}, {"mid", mission.id()}};
+
+      // Step progress: which objective the player is on and which ones are already done. Older receivers ignore
+      // these extra keys, so the record stays compatible.
+      record["state"] = static_cast<int>(mission.state());
+      if (mission.has_activeobjective()) {
+        const auto& objective    = mission.activeobjective();
+        record["objective"]      = objective.id();
+        record["objective_type"] = static_cast<int>(objective.type());
+        if (objective.targetcountervalue() > 0) {
+          record["target"] = objective.targetcountervalue();
+        }
+      }
+      auto done = json::array();
+      for (const auto objective_id : mission.objectivehistory()) {
+        done.push_back(objective_id);
+      }
+      record["done_objectives"] = std::move(done);
+
+      active_missions.emplace(mission.id(), std::move(record));
     }
 
     bool changed = false;
@@ -1884,8 +1906,8 @@ static void active_missions(std::unique_ptr<std::string>&& bytes)
     if (changed && !active_mission_states.empty()) {
       auto mission_array = json::array();
 
-      for (const auto mission : active_mission_states) {
-        mission_array.push_back({{"type", "active_" + SyncConfig::Type::Missions}, {"mid", mission}});
+      for (const auto& record : active_mission_states | std::views::values) {
+        mission_array.push_back(record);
       }
 
       workers::queue_data(SyncConfig::Type::Missions, mission_array);
@@ -2446,6 +2468,143 @@ static void store_offers(std::unique_ptr<std::string>&& bytes)
     }
   } else {
     spdlog::error("Failed to parse store offers");
+  }
+}
+
+// Events (the game calls them tournaments) arrive in Platform responses as an EventsModel group: the whole list the
+// Events screen shows, with schedule, milestones and the player's own entry. Seconds since the epoch, 0 when unset.
+static int64_t event_time(const google::protobuf::Timestamp& ts) { return ts.seconds(); }
+
+using EventRewards = google::protobuf::RepeatedPtrField<Digit::PrimePlatform::Models::EventReward>;
+
+static nlohmann::json event_rewards(const EventRewards& rewards)
+{
+  auto out = nlohmann::json::array();
+  for (const auto& reward : rewards) {
+    auto positions = nlohmann::json::array();
+    for (const auto position : reward.position()) {
+      positions.push_back(position);
+    }
+    out.push_back({{"id", store_offer_id(reward.type())},
+                   {"amount", reward.amount()},
+                   {"level", reward.level()},
+                   {"position", std::move(positions)}});
+  }
+  return out;
+}
+
+static nlohmann::json event_rank(const Digit::PrimePlatform::Models::EventRank& rank)
+{
+  return {{"score", rank.scoredouble() != 0.0 ? rank.scoredouble() : static_cast<double>(rank.score())},
+          {"position", rank.position()},
+          {"rank", rank.rank()}};
+}
+
+static void events(std::unique_ptr<std::string>&& bytes)
+{
+  using json = nlohmann::json;
+
+  static size_t     events_state = 0;
+  static std::mutex events_mtx;
+
+  if (auto response = Digit::PrimePlatform::Models::Events(); response.ParseFromString(*bytes)) {
+
+    http::logging::trace("PROCESS", "events", STR_FORMAT("Processing {} events", response.tournaments_size()));
+
+    auto list = json::array();
+    for (const auto& event : response.tournaments()) {
+      const auto& schedule = event.schedule();
+      const auto& meta     = event.metadata();
+
+      auto milestones = json::array();
+      for (const auto& segment : event.segments()) {
+        auto values = json::array();
+        for (const auto value : segment.values()) {
+          values.push_back(value);
+        }
+        milestones.push_back({{"segment_type", static_cast<int>(segment.type())},
+                              {"values", std::move(values)},
+                              {"rewards", event_rewards(segment.rewards())}});
+      }
+
+      auto scoring = json::array();
+      for (const auto& info : meta.scoringinfo()) {
+        scoring.push_back(info.id());
+      }
+
+      auto join_cost = json::array();
+      for (const auto& resource : event.joincost()) {
+        join_cost.push_back({{"id", store_offer_id(resource.id())}, {"amount", store_offer_amount(resource)}});
+      }
+
+      json record = {{"type", SyncConfig::Type::Events},
+                     {"id", event.configid()},
+                     {"event_type", event.eventtype()},
+                     {"category", static_cast<int>(event.category())},
+                     {"placement", static_cast<int>(event.placementtype())},
+                     {"group", event.groupname()},
+                     {"category_group", event.categorygroupid()},
+                     {"round", schedule.roundnumber()},
+                     {"announce", event_time(schedule.announce())},
+                     {"start", event_time(schedule.start())},
+                     {"end", event_time(schedule.end())},
+                     {"next_start", event_time(schedule.nextstart())},
+                     {"auto_register", meta.isautoregister()},
+                     {"cross_server", meta.iscrossserver()},
+                     {"scoring", std::move(scoring)},
+                     {"milestones", std::move(milestones)},
+                     {"join_cost", std::move(join_cost)}};
+
+      if (event.has_entrydata()) {
+        const auto& entry      = event.entrydata();
+        record["registered"]   = entry.isregistered();
+        record["can_claim"]    = entry.canclaim();
+        record["last_claimed"] = entry.lastclaimedrewardindex();
+      }
+      // The player's own standing only; leaderboards of other players (EventRanking groups) are not synced.
+      if (event.has_ranking()) {
+        record["player"] = event_rank(event.ranking());
+      } else if (event.has_ranks()) {
+        record["player"] = event_rank(event.ranks());
+      }
+
+      list.push_back(std::move(record));
+    }
+
+    const auto       state_value = std::hash<json>{}(list);
+    std::scoped_lock lk(events_mtx);
+    if (events_state != state_value && !list.empty()) {
+      events_state = state_value;
+      workers::queue_data(SyncConfig::Type::Events, list);
+    }
+  } else {
+    spdlog::error("Failed to parse events");
+  }
+}
+
+// Score changes for one event arrive as EventNotification groups between full refreshes.
+static void event_notification(std::unique_ptr<std::string>&& bytes)
+{
+  using json = nlohmann::json;
+
+  if (auto response = Digit::PrimePlatform::Models::EventNotification(); response.ParseFromString(*bytes)) {
+    if (response.configid().empty()) {
+      return;
+    }
+
+    json record = {{"type", "event_score"}, {"id", response.configid()}, {"modified", event_time(response.modified())}};
+    if (response.has_playerrank()) {
+      record["player"] = event_rank(response.playerrank());
+    }
+    if (response.has_entrydata()) {
+      record["registered"]   = response.entrydata().isregistered();
+      record["can_claim"]    = response.entrydata().canclaim();
+      record["last_claimed"] = response.entrydata().lastclaimedrewardindex();
+    }
+
+    workers::queue_data(SyncConfig::Type::Events, json::array({record}));
+  } else {
+    spdlog::error("Failed to parse event notification");
   }
 }
 
@@ -3153,7 +3312,21 @@ static void HandlePlatformResponse(ServiceResponse* service_response)
     }
 
     const auto* const type = group_type.Get<int32_t>(group);
-    if (type == nullptr || *type != Digit::Platform::Models::EntityGroup::TYPE_STOREOFFERS) {
+    if (type == nullptr) {
+      continue;
+    }
+
+    using PlatformGroup = Digit::Platform::Models::EntityGroup;
+    void (*processor)(std::unique_ptr<std::string>&&) = nullptr;
+    const auto& options = Config::Get().sync_options;
+    if (*type == PlatformGroup::TYPE_STOREOFFERS && options.store_offers) {
+      processor = processors::store_offers;
+    } else if (*type == PlatformGroup::TYPE_EVENTSMODEL && options.events) {
+      processor = processors::events;
+    } else if (*type == PlatformGroup::TYPE_EVENTNOTIFICATION && options.events) {
+      processor = processors::event_notification;
+    }
+    if (processor == nullptr) {
       continue;
     }
 
@@ -3165,9 +3338,9 @@ static void HandlePlatformResponse(ServiceResponse* service_response)
     auto payload = std::make_unique<std::string>(reinterpret_cast<const char*>(bytes->bytes->m_Items),
                                                  static_cast<size_t>(bytes->Length));
     try {
-      std::thread([p = std::move(payload)]() mutable {
+      std::thread([processor, p = std::move(payload)]() mutable {
         try {
-          processors::store_offers(std::move(p));
+          processor(std::move(p));
         } catch (const std::exception& e) {
           spdlog::error("Exception in HandlePlatformResponse: {}", e.what());
         } catch (...) {
@@ -3500,8 +3673,9 @@ static void* RtcParser_ParseFinalPayload(auto original, void* _this, CentrifugoI
 static void GameServerModelRegistry_ProcessResultInternal(auto original, void* _this, void* parsing_context,
                                                           ServiceResponse* service_response, MethodInfo* method)
 {
-  // Only the store offers option looks at Platform responses; everyone else keeps the unchanged path below.
-  if (Config::Get().sync_options.store_offers && IsPlatformResponse(service_response)) {
+  // Only the store offers and events options look at Platform responses; everyone else keeps the unchanged path below.
+  if ((Config::Get().sync_options.store_offers || Config::Get().sync_options.events)
+      && IsPlatformResponse(service_response)) {
     HandlePlatformResponse(service_response);
     return original(_this, parsing_context, service_response, method);
   }

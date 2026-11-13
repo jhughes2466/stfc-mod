@@ -980,6 +980,10 @@ slots = true
 # Sync faction store offer data. Requires mod 1.1.10 or newer.
 store_offers = false
 
+# Do you want to sync events (the Events screen: schedule, milestones, rewards and your own score)? Opt-in, off by default.
+# Only your own standing is sent, never other players' leaderboards.
+events = false
+
 # Do you want to sync owned forbidden tech data?
 tech = true
 
